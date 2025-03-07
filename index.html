@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leaflet Crtanje Kvadrata</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/proj4@2.8.1"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+    <style>
+        #map { height: 100vh; }
+
+        #buttonContainer {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        // Inicijalizacija mape
+        var map = L.map('map').setView([45.815, 15.981], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        
+        var drawnItems = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+        
+        var drawControl = new L.Control.Draw({
+            draw: {
+                rectangle: {
+                    shapeOptions: { color: 'blue' }
+                },
+                polygon: false,
+                polyline: false,
+                circle: false,
+                marker: false,
+                circlemarker: false
+            },
+            edit: { featureGroup: drawnItems }
+        });
+        map.addControl(drawControl);
+        
+        proj4.defs("EPSG:3765", 
+            "+proj=tmerc +lat_0=0 +lon_0=16.5 +k=0.9999 +x_0=500000 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs");
+        
+        function fetchWithRetry(url, attempts) {
+            return fetch(url)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .catch(error => {
+                    if (attempts > 1) {
+                        console.warn(`Ponovni pokušaj dohvaćanja... Preostalo pokušaja: ${attempts - 1}`);
+                        return fetchWithRetry(url, attempts - 1);
+                    } else {
+                        alert("Server DGU opterećen")
+                        console.error("Greška prilikom dohvaćanja podataka:", error);
+                    }
+                });
+        }
+        
+        var transformedGeoJSON
+        map.on(L.Draw.Event.CREATED, function (e) {
+            var layer = e.layer;
+            var bounds = layer.getBounds();
+            var sw = bounds.getSouthWest();
+            var ne = bounds.getNorthEast();
+            
+            var sw_3765 = proj4("EPSG:4326", "EPSG:3765", [sw.lng, sw.lat]);
+            var ne_3765 = proj4("EPSG:4326", "EPSG:3765", [ne.lng, ne.lat]);
+            
+            var dx = ne_3765[0] - sw_3765[0];
+            var dy = ne_3765[1] - sw_3765[1];
+            var diagonal = Math.sqrt(dx * dx + dy * dy);
+            
+            if (diagonal > 2000) {
+                alert("Kvadrat ne smije imati dijagonalu veću od 2000m!");
+            } else {
+                drawnItems.addLayer(layer);
+                console.log("Koordinate EPSG:3765", sw_3765, ne_3765);
+                
+                var bbox = `${sw_3765[0]},${sw_3765[1]},${ne_3765[0]},${ne_3765[1]}`;
+                var url = `https://api.uredjenazemlja.hr/services/inspire/cp/wfs?SERVICE=WFS&outputFormat=application/json&version=2.0.0&request=GetFeature&TYPENAMES=cp:CadastralParcel&bbox=${bbox}`;
+                
+                
+                fetchWithRetry(url, 5)
+                    .then(data => {
+                        if (!data) return;
+                        console.log("WFS Response:", data);
+                        
+                         transformedGeoJSON = {
+                        type: "FeatureCollection",
+                        features: data.features.map(feature => {
+                            if (!feature.geometry || !feature.geometry.coordinates) {
+                                console.warn("Neispravan geometrijski objekt:", feature);
+                                return null;
+                            }
+
+                            let transformedGeometry;
+                            
+                            if (feature.geometry.type === "Polygon") {
+                                transformedGeometry = {
+                                    type: "Polygon",
+                                    coordinates: feature.geometry.coordinates.map(ring =>
+                                        ring.map(coord => {
+                                            if (!Array.isArray(coord) || coord.length !== 2 || isNaN(coord[0]) || isNaN(coord[1])) {
+                                                console.warn("Preskačem neispravnu koordinatu:", coord);
+                                                return null;
+                                            }
+                                            return proj4("EPSG:3765", "EPSG:4326", coord);
+                                        }).filter(c => c !== null)
+                                    )
+                                };
+                            } else {
+                                console.warn("Nepodržan tip geometrije:", feature.geometry.type);
+                                return null;
+                            }
+
+                            return {
+                                ...feature,
+                                geometry: transformedGeometry
+                            };
+                        }).filter(f => f !== null)
+                    };
+                        console.log(transformedGeoJSON)
+                        if(transformedGeoJSON){
+                            L.geoJSON(transformedGeoJSON, {
+                            onEachFeature: function (feature, layer) {
+                                if (feature.properties && feature.properties.label) {
+                                    layer.bindPopup(feature.properties.label);
+                                }
+                            }
+                        }).addTo(map);
+
+                        drawnItems.clearLayers()
+                        addButton()
+                       
+                        }
+                      
+                    });
+            }
+        });
+
+
+
+        function addButton(){
+
+    var existingButtonContainer = document.getElementById('buttonContainer');
+    if (existingButtonContainer) {
+        existingButtonContainer.remove();
+    }
+
+
+    var buttonContainer = document.createElement('div');  // Create a container for the button
+    buttonContainer.setAttribute('id', 'buttonContainer');
+    document.getElementById('map').appendChild(buttonContainer);
+    // Stack the buttons vertically by setting display to block
+    // buttonContainer.style.display = "flex";
+    // buttonContainer.style.flexDirection = "column";  // Stack buttons vertically
+    // buttonContainer.style.alignItems = "center";  // Align buttons in the center
+
+
+    var zkButton = document.createElement('button');
+    buttonContainer.style.position = "absolute";  // Ensuring it's absolute positioned
+    zkButton.innerHTML = "Pogledaj gradsku imovinu";  // Button text
+    zkButton.style.padding = "10px 20px";
+   
+    zkButton.style.fontSize = "16px";
+    zkButton.style.backgroundColor = "#007bff";
+    zkButton.style.color = "white";
+    zkButton.style.border = "none";
+    zkButton.style.borderRadius = "5px";
+    zkButton.style.cursor = "pointer";
+    buttonContainer.style.zIndex = "1000";  // Ensure it appears above the map
+
+    buttonContainer.appendChild(zkButton);
+
+    var downloadButton = document.createElement('button');
+    buttonContainer.style.position = "absolute";  // Ensuring it's absolute positioned
+    downloadButton.innerHTML = "Preuzmi GeoJSON";  // Button text
+    downloadButton.style.padding = "10px 20px";
+  
+    downloadButton.style.fontSize = "16px";
+    downloadButton.style.backgroundColor = "#007bff";
+    downloadButton.style.color = "white";
+    downloadButton.style.border = "none";
+    downloadButton.style.borderRadius = "5px";
+    downloadButton.style.cursor = "pointer";
+    buttonContainer.style.zIndex = "1000";  // Ensure it appears above the map
+
+    buttonContainer.appendChild(downloadButton);
+
+    downloadButton.addEventListener('click', function () {
+        var geojsonData = transformedGeoJSON;
+        var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(geojsonData));
+        var downloadAnchorNode = document.createElement('a');
+        downloadAnchorNode.setAttribute("href", dataStr);
+        downloadAnchorNode.setAttribute("download", "drawn_data.geojson");
+        document.body.appendChild(downloadAnchorNode);
+        downloadAnchorNode.click();
+        downloadAnchorNode.remove();
+
+
+    });
+
+    zkButton.addEventListener('click', function () {
+      
+        var geojsonData = transformedGeoJSON;
+    console.log(transformedGeoJSON);
+
+    geojsonData.features.forEach(feature => {
+        const localId = feature.properties.inspireId.localId;
+        const parcelId = localId.substring(3);
+
+        console.log("Parcel ID:", parcelId);
+
+        fetch(`https://oss.uredjenazemlja.hr/oss/public/cad/parcel-info?parcelId=${parcelId}`)
+            .then(response => response.json())
+            .then(data => {
+                console.log("Podaci parcele:", data);
+                // Obradite podatke parcele ovdje
+            })
+            .catch(error => {
+                console.error("Greška prilikom dohvaćanja podataka:", error);
+            });
+    })
+       
+
+    });
+
+        }
+
+
+    </script>
+</body>
+</html>
